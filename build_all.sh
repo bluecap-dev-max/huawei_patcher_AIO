@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 ###############################################################################
-#  P20 Pro (CLT-AL01 / Kirin 970 / 麒麟 970) + ReSukiSU 一键内核构建
+#  华为 EMUI 9 / 9.1（Linux 4.9 内核）+ ReSukiSU 一键内核构建
+#  适用：任何 EMUI 9.x 机型的官方开源内核包（非单一机型）
 ###############################################################################
 #  用法：
 #     bash build_all.sh                    # 自动用脚本所在目录
@@ -8,18 +9,26 @@
 #     bash build_all.sh <内核tar包路径>      # 直接指定那个 .tar.gz
 #     bash build_all.sh <共享目录> <输出目录> # 手动指定输出目录
 #
+#  可选环境变量：
+#     KSU_NPROC=N        # 手动指定编译并行度
+#     KSU_DEFCONFIG=xxx  # 手动指定 defconfig 文件名（多 defconfig 时必用）
+#     KSU_SUSFS=0        # 关闭 SUSFS，回到 MANUAL_HOOK 模式（默认开启 SUSFS）
+#
 #  环境要求：WSL (Ubuntu 20.04+) 或 Linux，能用 sudo 装包
 #  核心设计：
 #    · 自动安装缺失工具（宿主工具链 + aarch64 交叉编译器）
 #    · 自动探测可用核心，全占用（可用 KSU_NPROC=N 覆盖）
 #    · WSL 下输出目录强制走 $HOME（ext4），避开 /mnt/* 的跨文件系统瓶颈
-#    · ReSukiSU 非 GKI → MANUAL_HOOK，注入 6 个 hook + extern 原型
-#    · 严格按社区文档关闭 26 项检测，SELinux 保持 enforcing
-#    · 用华为官方 mkbootimg 参数打包（CLT 机型专属 offset）
+#    · ReSukiSU 非 GKI：默认走 SUSFS inline hook（8 个检查点），
+#      KSU_SUSFS=0 时回退到 MANUAL_HOOK（6 个 hook + LSM 托管 3 个）
+#    · SUSFS v2.3.0 4.9 移植补丁 + 华为 4.9.148 树专用 fixup
+#    · 严格按社区文档（EMUI 9/9.1 通用清单）关闭检测，SELinux 保持 enforcing
+#    · 打包参数从内核源码自带的 pack_kernerimage_cmd.sh 提取——
+#      每个机型用自己的官方值，脚本不写死任何机型的 offset
 ###############################################################################
 
 SHARE_ARG="${1:-}"
-DEST="${2:-$HOME/kirin970-final}"
+DEST="${2:-$HOME/ksu-kernel-final}"
 
 # ---- 输出颜色 ----
 if [ -t 1 ]; then
@@ -38,20 +47,30 @@ step(){ echo ""; echo "══ $* ═══════════════�
 #   写在那儿慢 5-10 倍，.o 的 stat 也会成瓶颈。
 if [ -z "${2:-}" ]; then
     case "$DEST" in
-        /mnt/*|/media/*) DEST="$HOME/kirin970-final" ;;
+        /mnt/*|/media/*) DEST="$HOME/ksu-kernel-final" ;;
     esac
 fi
 
 # ---- 定位共享目录 ----
-# ★ 顺序：脚本自身目录（最可靠）→ WSL(/mnt/*) → /media/sf_*（VirtualBox）
+# ★ 顺序：脚本自身目录（最可靠）→ WSL 挂载盘下的构建类目录 → /media/sf_*（VirtualBox）
+#   候选路径只做"初筛"，真正的有效性由后面的 tar 包搜索与参数校验把关，
+#   所以这里不写死任何具体目录名。
 KERTAR=""
 SHARE="$SHARE_ARG"
 if [ -z "$SHARE" ]; then
     SELF_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
-    for c in "$SELF_DIR" \
-             /mnt/d/kirin970-resukisu-build /mnt/c/kirin970-resukisu-build \
-             /mnt/hgfs/kirin970-resukisu-build \
-             /media/sf_kbld /media/sf_kirin970-resukisu-build ; do
+    SHARE_CANDS="$SELF_DIR"
+    # WSL 挂载盘（/mnt/c /mnt/d ...）下一级目录里名字像构建目录的
+    for m in /mnt/*/; do
+        for sub in "$m"*build*/ "$m"*kirin*/ "$m"*ksu*/ "$m"*resukisu*/; do
+            [ -d "$sub" ] && SHARE_CANDS="$SHARE_CANDS $sub"
+        done
+    done
+    # VirtualBox / VMware 共享盘
+    for m in /media/sf_*/ /mnt/hgfs/*/; do
+        [ -d "$m" ] && SHARE_CANDS="$SHARE_CANDS $m"
+    done
+    for c in $SHARE_CANDS; do
         [ -n "$c" ] && [ -d "$c" ] && [ "$(ls -A "$c" 2>/dev/null | wc -l)" -gt 0 ] \
             && SHARE="$c" && break
     done
@@ -71,7 +90,7 @@ if [ -n "$SHARE" ] && [ ! -e "$SHARE" ]; then
 fi
 if [ -z "$SHARE" ]; then
     echo "${R}✗ 找不到可用目录。请传参:${N}"
-    echo "    bash $0 /mnt/d/kirin970-resukisu-build"
+    echo "    bash $0 <含内核 tar 包的目录>"
     exit 1
 fi
 if [ -f "$SHARE" ]; then
@@ -83,6 +102,12 @@ mkdir -p "$DEST" 2>/dev/null
 DEST="$(cd "$DEST" && pwd)"
 LOGS="$DEST/logs"
 mkdir -p "$LOGS"
+
+# ★ 把实际使用的输出目录落盘，供 test.sh 读取 ——
+#   这样清理脚本永远清的是同一个目录（包括用户用第二个参数自定义的情况），
+#   不靠正则去猜默认值，不会与本脚本失步。
+_SELF_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+[ -n "$_SELF_DIR" ] && printf '%s\n' "$DEST" > "$_SELF_DIR/.ksu_dest" 2>/dev/null
 
 # =============================================================================
 step "0/8  环境与工具链"
@@ -171,9 +196,9 @@ apt_install() {   # apt_install <包名...>
 }
 
 # ---- 宿主构建工具 ----
-HOST_PKGS="build-essential bc flex bison libssl-dev libncurses-dev python3 git cpio"
+HOST_PKGS="build-essential bc flex bison libssl-dev libncurses-dev python3 git cpio patch"
 MISSING_HOST=""
-for t in make bc flex bison python3 git tar gzip cpio; do
+for t in make bc flex bison python3 git tar gzip cpio patch; do
     command -v "$t" >/dev/null 2>&1 || MISSING_HOST="$MISSING_HOST $t"
 done
 
@@ -216,7 +241,7 @@ if [ -n "$MISSING_HOST" ]; then
     say "  请手动执行："
     say "    sudo apt update"
     say "    sudo apt install -y build-essential make bc flex bison \\"
-    say "        libssl-dev libncurses-dev python3 git cpio"
+    say "        libssl-dev libncurses-dev python3 git cpio patch"
     exit 1
 fi
 ok "构建工具齐备（make $(make --version 2>/dev/null | head -1 | grep -o '[0-9.]*' | head -1)）"
@@ -389,10 +414,14 @@ if [ -f "$KS/Makefile" ]; then
     ok "已解包，跳过（幂等）"
 else
     if [ -z "$KERTAR" ]; then
+        # ★ 华为官方开源内核包的命名规律：{机型代号}_PIE_EMUI9.1.0_opensource.tar.gz
+        #   机型代号随机器变化（CLT/VTR/BLA/EML/...），所以按通用特征匹配：
+        #   文件名含 opensource / EMUI / PIE / kernel，且体积大（几百 MB）。
         for cand in \
-            "$SHARE"/CLT_PIE*.tar.gz "$SHARE"/*opensource*.tar.gz "$SHARE"/*kernel*.tar.gz \
-            "$SHARE"/ISO/CLT_PIE*.tar.gz "$SHARE"/*/CLT_PIE*.tar.gz \
-            "$SHARE"/*/*opensource*.tar.gz \
+            "$SHARE"/*opensource*.tar.gz "$SHARE"/*EMUI*.tar.gz \
+            "$SHARE"/*PIE*.tar.gz "$SHARE"/*kernel*.tar.gz \
+            "$SHARE"/ISO/*opensource*.tar.gz "$SHARE"/ISO/*EMUI*.tar.gz \
+            "$SHARE"/*/*opensource*.tar.gz "$SHARE"/*/*EMUI*.tar.gz \
             ; do
             [ -f "$cand" ] && KERTAR="$cand" && break
         done
@@ -400,7 +429,8 @@ else
         #   用 find 再兜一次底。
         if [ -z "$KERTAR" ]; then
             KERTAR=$(find "$SHARE" -maxdepth 3 -type f \
-                     \( -name 'CLT_PIE*.tar.gz' -o -name '*opensource*.tar.gz' \) 2>/dev/null | head -1)
+                     \( -iname '*opensource*.tar.gz' -o -iname '*emui*.tar.gz' \
+                        -o -iname '*pie*kernel*.tar.gz' \) 2>/dev/null | head -1)
         fi
     fi
     if [ -z "$KERTAR" ] || [ ! -f "$KERTAR" ]; then
@@ -412,13 +442,14 @@ else
             say "  实际找到的 .tar.gz："
             echo "$F" | sed 's/^/      /'
             say ""
-            say "  ★ 这些都不是内核包（内核包名含 CLT_PIE 或 opensource，约 460MB）。"
+            say "  ★ 这些都不是华为官方内核包（官方包名形如"
+            say "    {机型代号}_PIE_EMUI9.1.0_opensource.tar.gz，通常数百 MB）。"
         else
             say "  (一个 .tar.gz 都没有)"
         fi
         say ""
         say "  可直接指定内核包："
-        say "    bash $0 \"\$(find $SHARE -maxdepth 3 -name 'CLT_PIE*.tar.gz' | head -1)\""
+        say "    bash $0 \"\$(find $SHARE -maxdepth 3 -iname '*opensource*.tar.gz' | head -1)\""
         exit 1
     fi
     info "$(basename "$KERTAR")  $(du -h "$KERTAR" | cut -f1)"
@@ -456,13 +487,44 @@ step "2/8  关闭华为 root 检测 / 完整性校验"
 # =============================================================================
 #  清单来源：Coconutat《KernelSU适配EMUI9或9.1.0系统的内核》wiki
 #            https://github.com/Coconutat/HuaweiP10-GSI-And-Modify-Tutorial
-#  ★ 严格只按社区文档，逐条照抄，多一项都不关、无一项都不关。
-#    已实测：该 26 项在本机 defconfig 中【全部为 =y 且全部存在】，零缺失零多余。
-DEFCONF=$(find "$KS/arch/arm64/configs" -name '*kirin970*defconfig' 2>/dev/null | head -1)
-[ -z "$DEFCONF" ] && DEFCONF=$(find "$KS/arch/arm64/configs" -name '*defconfig' 2>/dev/null | head -1)
+#  ★ 严格只按社区文档（EMUI 9/9.1 全机型通用清单），逐条照抄，
+#    多一项都不关、无一项都不关。该清单与具体机型无关。
+
+# ---- 选择 defconfig：不写死任何机型名 ----
+#   优先级：
+#     1) 环境变量 KSU_DEFCONFIG（多 defconfig 歧义时最可靠）
+#     2) 文件名匹配机型代号（从内核 tar 包名前缀推断，如 CLT_PIE_* → CLT）
+#     3) merge_*_defconfig（华为 EMUI 9 官方包惯例的合并 defconfig）
+#     4) 仅有一个 defconfig → 直接用
+#     5) 仍歧义 → 列出全部候选并报错，要求显式指定
+CFGDIR="$KS/arch/arm64/configs"
+DEFCONF=""
+if [ -n "${KSU_DEFCONFIG:-}" ]; then
+    DEFCONF="$CFGDIR/$KSU_DEFCONFIG"
+    [ -f "$DEFCONF" ] || { bad "KSU_DEFCONFIG 指定的文件不存在: $KSU_DEFCONFIG"; exit 1; }
+else
+    # 从内核 tar 包名推断机型代号（如 CLT_PIE_EMUI9.1.0_opensource → CLT）
+    DEV_CODE=$(basename "${KERTAR:-}" | sed -n 's/^\([A-Za-z0-9]*\)_PIE.*/\1/p' | tr 'A-Z' 'a-z')
+    [ -n "$DEV_CODE" ] && \
+        DEFCONF=$(find "$CFGDIR" -iname "*${DEV_CODE}*defconfig" 2>/dev/null | head -1)
+    [ -z "$DEFCONF" ] && \
+        DEFCONF=$(find "$CFGDIR" -name 'merge_*defconfig' 2>/dev/null | head -1)
+    if [ -z "$DEFCONF" ]; then
+        ALL_CFG=$(find "$CFGDIR" -name '*_defconfig' 2>/dev/null)
+        if [ "$(echo "$ALL_CFG" | grep -c .)" = "1" ]; then
+            DEFCONF="$ALL_CFG"
+        elif [ -n "$ALL_CFG" ]; then
+            bad "有多个 defconfig 无法自动判定，请用 KSU_DEFCONFIG 显式指定："
+            echo "$ALL_CFG" | sed "s|$CFGDIR/|      |"
+            say ""
+            say "  用法：KSU_DEFCONFIG=<文件名> bash $0 ..."
+            exit 1
+        fi
+    fi
+fi
 if [ -z "$DEFCONF" ] || [ ! -f "$DEFCONF" ]; then
     bad "找不到 defconfig"
-    ls -la "$KS/arch/arm64/configs/" 2>/dev/null | head -15 | sed 's/^/      /'
+    ls -la "$CFGDIR/" 2>/dev/null | head -15 | sed 's/^/      /'
     exit 1
 fi
 ok "defconfig: $(basename "$DEFCONF")"
@@ -509,7 +571,7 @@ if grep -qE "^CONFIG_KPROBES=y$" "$DEFCONF" 2>/dev/null; then
 fi
 
 # =============================================================================
-step "3/8  安装 ReSukiSU"
+step "3/8  安装 ReSukiSU + 集成 SUSFS"
 # =============================================================================
 KSU="$KS/drivers/kernelsu"
 KSUSRC=""
@@ -589,6 +651,150 @@ else
       && ok "git 仓库已建（commits=$(cd "$KS/drivers" && git rev-list --count HEAD 2>/dev/null)）" \
       || { bad "git 仓库创建失败，Kbuild 会拒绝"; exit 1; }
 fi
+
+# =============================================================================
+# ---- SUSFS：Linux 4.9 NON-GKI 内核侧补丁 ----
+# =============================================================================
+# ★ 为什么不用官方 susfs4ksu 的 kernel-4.9 分支？
+#   官方 kernel-4.9 分支停在 SUSFS v1.5.5（2025-02），而当前 ReSukiSU 4.x
+#   的 kernel 代码调用的是 v2.x API（susfs_show_version / susfs_get_enabled_features
+#   / susfs_run_sus_path_loop / susfs_set_current_proc_umounted ...），
+#   用 v1.5.5 会直接编译失败。
+#   → 这里用社区维护的 SUSFS v2.3.0 NON-GKI 4.9 移植补丁
+#     （JackA1ltman/NonGKI_Kernel_Build_2nd，经 ReSukiSU 4.9 项目验证）。
+#
+# ★ 补丁基线是 4.9.186/4.9.337（CAF 4.9），在华为 4.9.148 真源码上实测：
+#     fs/namei.c / fs/readdir.c / fs/proc/* 等 15 个文件全部直接应用成功，
+#     其余由 fixup 脚本按华为树修复（每一项都有真实编译错误对应）：
+#       include/linux/susfs_def.h  linux/bits.h 是 5.x 才有的头 → 换 bitops.h
+#       fs/namespace.c             华为多一行 hisi include → Hunk #1 不匹配
+#       kernel/sys.c               华为 newuname 不用临时结构体 → uname spoof 改写
+#       fs/stat.c                  4.9 无 statx/result_mask → 等价移植（并补
+#                                  susfs_def.h include，补丁本身没加）
+#       fs/proc/task_mmu.c         纯尾随空格 hunk（华为无该上下文）
+#       fs/notify/fdinfo.c         4.9 全系缺 inotify_mark_user_mask()
+#       fs/proc/cmdline.c          fuzz 会把 hunk 贴错位置 → 重写为正确结构
+#       fs/read_write.c / input.c  块作用域 extern 不能带 __read_mostly
+#                                  （error: section attribute cannot be
+#                                  specified for local variables）
+#       fs/susfs.c                 susfs_run_sus_path_loop 是 static，
+#                                  ReSukiSU 需要外部调用 → 去 static
+#       fs/proc/task_mmu.c         4.9 没有 show_vma_header_prefix() → 补 helper
+#       fs/stat.c                  SUSFS 模式不能注入 manual 专用的
+#                                  newfstat_ret/fstat64_ret（会 undefined reference）
+SUSFS_ON=""
+KSU_SUSFS="${KSU_SUSFS:-1}"
+case "$KSU_SUSFS" in
+    0|n|N|no|NO|off|false)
+        info "KSU_SUSFS=$KSU_SUSFS → 跳过 SUSFS，回退 MANUAL_HOOK"
+        # 清掉以前可能写进 defconfig 的 SUSFS 项，避免“半开”状态
+        if [ -n "${DEFCONF:-}" ] && [ -f "$DEFCONF" ]; then
+            sed -i '/^CONFIG_KSU_SUSFS/d' "$DEFCONF"
+            sed -i '/^# CONFIG_KSU_SUSFS/d' "$DEFCONF"
+        fi
+        ;;
+    *)
+        SUSFS_ON=1
+        SUSFS_DIR=""
+        for c in "$SHARE/susfs4ksu-4.9" "$SHARE/src/susfs4ksu-4.9" \
+                 "$SHARE/susfs" "$SHARE/SUSFS"; do
+            if [ -f "$c/susfs_patch_to_4.9.patch" ] && \
+               [ -f "$c/fixup_susfs_4.9_huawei.py" ]; then
+                SUSFS_DIR="$c"; break
+            fi
+        done
+        if [ -z "$SUSFS_DIR" ]; then
+            bad "找不到 SUSFS 4.9 补丁目录"
+            say ""
+            say "  需要以下两个文件（默认应放在 $SHARE/susfs4ksu-4.9/）："
+            say "    susfs_patch_to_4.9.patch"
+            say "    fixup_susfs_4.9_huawei.py"
+            say ""
+            say "  也可以设置 KSU_SUSFS=0 跳过 SUSFS，只用 MANUAL_HOOK。"
+            exit 1
+        fi
+        info "SUSFS 源: $SUSFS_DIR"
+        info "只修改 $DEST 下的解包副本；原始 tar 包和 src/ 均只读，不会被改动"
+
+        # ★ ReSukiSU 的 Kconfig: config KSU_SUSFS depends on THREAD_INFO_IN_TASK
+        #   华为 4.9.148 已 select，若没有会在 olddefconfig 被静默丢弃，
+        #   这里提前硬失败，避免白编译一小时。
+        if ! grep -q 'select THREAD_INFO_IN_TASK' "$KS/arch/arm64/Kconfig" 2>/dev/null && \
+           ! grep -qE '^CONFIG_THREAD_INFO_IN_TASK=y$' "$DEFCONF" 2>/dev/null; then
+            bad "内核没有 THREAD_INFO_IN_TASK，CONFIG_KSU_SUSFS 的 Kconfig 依赖不满足"
+            say "    arch/arm64/Kconfig 未 select，defconfig 也没有该行。"
+            say "    请用 KSU_SUSFS=0 构建 MANUAL_HOOK 版本。"
+            exit 1
+        fi
+        ok "THREAD_INFO_IN_TASK 满足（CONFIG_KSU_SUSFS 可开启）"
+
+        # 幂等判断：三个关键文件都在且版本宏已定义才算已集成
+        if [ -f "$KS/fs/susfs.c" ] && [ -f "$KS/include/linux/susfs_def.h" ] && \
+           grep -q '^#define SUSFS_VERSION' "$KS/include/linux/susfs.h" 2>/dev/null; then
+            ok "SUSFS 已应用，跳过补丁（幂等）"
+        else
+            info "应用 SUSFS v2.3.0 4.9 补丁（预期少数 hunk 由 fixup 处理）..."
+            ( cd "$KS" && patch -p1 -l --forward --fuzz=3 \
+                --no-backup-if-mismatch \
+                < "$SUSFS_DIR/susfs_patch_to_4.9.patch" ) \
+                > "$LOGS/susfs-patch.log" 2>&1
+            PRC=$?
+            if [ $PRC -eq 0 ]; then
+                ok "补丁全部 hunk 直接应用成功"
+            elif [ $PRC -eq 1 ]; then
+                info "有 hunk 未直接应用（退出码 1），交给 fixup 处理"
+                grep -E 'FAILED|Hunk|checking file' "$LOGS/susfs-patch.log" \
+                    | grep -B1 FAILED | head -20 | sed 's/^/      /'
+            else
+                bad "patch 执行异常（退出码 $PRC）"
+                tail -20 "$LOGS/susfs-patch.log" | sed 's/^/      /'
+                exit 1
+            fi
+        fi
+
+        info "按华为 4.9.148 树结构做 fixup..."
+        if ! python3 "$SUSFS_DIR/fixup_susfs_4.9_huawei.py" "$KS"; then
+            bad "SUSFS fixup 失败（详见上方输出与 $LOGS/susfs-patch.log）"
+            say ""
+            say "  若提示某文件有 .rej，说明该内核版本的结构与 4.9.148 有出入，"
+            say "  需要按 .rej 手工调整；不要带着 .rej 继续编译。"
+            exit 1
+        fi
+        ok "SUSFS fixup 完成"
+
+        # ---- 关键文件与 Makefile 接入校验 ----
+        for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            [ -f "$KS/$f" ] || { bad "SUSFS 关键文件缺失: $f"; exit 1; }
+        done
+        if ! grep -q 'susfs.o' "$KS/fs/Makefile" 2>/dev/null; then
+            printf '\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n' >> "$KS/fs/Makefile"
+            info "fs/Makefile 补加 obj-\$(CONFIG_KSU_SUSFS) += susfs.o"
+        fi
+        ok "SUSFS 就位: $(grep -m1 '^#define SUSFS_VERSION' "$KS/include/linux/susfs.h" | sed 's/.*"\(.*\)".*/\1/')"
+
+        # ---- defconfig：开 SUSFS、关 MANUAL_HOOK ----
+        # ★ 必须关 MANUAL_HOOK：
+        #   ksu.c 的 ksu_hook_init() 在 CONFIG_KSU_MANUAL_HOOK 下选
+        #   ksu_lsm_hook_init()，只有 SUSFS 分支才调 susfs_init()；
+        #   两者同开会让 SUSFS 的内部结构/工作队列不初始化。
+        if [ -n "${DEFCONF:-}" ] && [ -f "$DEFCONF" ]; then
+            for k in KSU_MANUAL_HOOK KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+                     KSU_MANUAL_HOOK_AUTO_INITRC_HOOK KSU_MANUAL_HOOK_AUTO_INPUT_HOOK; do
+                sed -i "/^CONFIG_$k=/d;/^# CONFIG_$k is not set\$/d" "$DEFCONF"
+                printf '# CONFIG_%s is not set\n' "$k" >> "$DEFCONF"
+            done
+            for o in KSU_SUSFS SUS_PATH SUS_MOUNT SUS_KSTAT SPOOF_UNAME \
+                     ENABLE_LOG HIDE_KSU_SUSFS_SYMBOLS SPOOF_CMDLINE_OR_BOOTCONFIG \
+                     OPEN_REDIRECT SUS_MAP; do
+                key="CONFIG_KSU_SUSFS"
+                [ "$o" = "KSU_SUSFS" ] || key="CONFIG_KSU_SUSFS_$o"
+                grep -qE "^${key}=" "$DEFCONF" 2>/dev/null && continue
+                printf '%s=y\n' "$key" >> "$DEFCONF"
+            done
+            ok "defconfig 已开 SUSFS + 9 个子项，并显式关闭 MANUAL_HOOK"
+        fi
+        ;;
+esac
 
 # =============================================================================
 say ""
@@ -681,21 +887,51 @@ PY2TO3
 fi
 
 # =============================================================================
-step "4/8  打 hook（MANUAL_HOOK）"
+step "4/8  打 hook（SUSFS inline / MANUAL_HOOK）"
 # =============================================================================
-# ★ 4.9 是非 GKI → TP_HOOK 会被 Kbuild $(error)，必须 MANUAL_HOOK。
-for o in "CONFIG_KSU=y" "CONFIG_KALLSYMS_ALL=y" "CONFIG_KSU_MANUAL_HOOK=y" \
-         "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y" \
-         "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y" \
-         "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y"; do
+# ★ 4.9 是非 GKI → TP_HOOK 会被 Kbuild $(error)。
+#   · KSU_SUSFS=1（默认）→ SUSFS inline hook 模式：需要 8 个检查点，
+#     其中 setuid / sys_read / input 不再由 LSM/input_handler 托管；
+#     另外 SUSFS 用 vfs_fstat 代替 manual 模式下的 newfstat_ret/fstat64_ret
+#     来修正 init.rc 的 st_size。
+#   · KSU_SUSFS=0        → MANUAL_HOOK 模式：只注入 6 个，
+#     setuid / init rc / input 由 LSM / input_handler 托管。
+for o in "CONFIG_KSU=y" "CONFIG_KALLSYMS_ALL=y"; do
     grep -qE "^${o%=}=" "$DEFCONF" 2>/dev/null && continue
     printf '%s\n' "$o" >> "$DEFCONF"
 done
-ok "defconfig 已加 KSU + MANUAL_HOOK"
+if [ -z "$SUSFS_ON" ]; then
+    for o in "CONFIG_KSU_MANUAL_HOOK=y" \
+             "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y" \
+             "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y" \
+             "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y"; do
+        grep -qE "^${o%=}=" "$DEFCONF" 2>/dev/null && continue
+        printf '%s\n' "$o" >> "$DEFCONF"
+    done
+    ok "defconfig 已加 KSU + MANUAL_HOOK"
+else
+    ok "defconfig 已加 KSU（SUSFS inline hook 模式，不启用 MANUAL_HOOK）"
+fi
 
 do_hook() {   # do_hook <相对路径> <hook名>  已注入返回0
     grep -q "$2" "$KS/$1" 2>/dev/null
 }
+
+# ★ 从 SUSFS 切回 MANUAL_HOOK 时，源码里残留的 3 个 SUSFS inline hook 会和
+#   LSM / input_handler 重复调用（setuid 执行两次）。这种情况必须重新解包，
+#   不能靠“跳过注入”混过去。
+if [ -z "$SUSFS_ON" ]; then
+    RESIDUE=""
+    do_hook "kernel/sys.c"           "ksu_handle_setresuid"          && RESIDUE="$RESIDUE kernel/sys.c"
+    do_hook "fs/read_write.c"        "ksu_handle_sys_read"           && RESIDUE="$RESIDUE fs/read_write.c"
+    do_hook "drivers/input/input.c"  "ksu_handle_input_handle_event" && RESIDUE="$RESIDUE drivers/input/input.c"
+    if [ -n "$RESIDUE" ]; then
+        bad "检测到 SUSFS inline hook 残留:$RESIDUE"
+        say "    当前是 KSU_SUSFS=0（MANUAL_HOOK），这些 hook 会与 LSM 重复调用。"
+        say "    请先运行  bash test.sh  清理源码后重新构建，或继续用 SUSFS 模式。"
+        exit 1
+    fi
+fi
 
 # ★★ Kbuild 的检查点决定哪些需要注入（这是权威依据，不是猜）：
 #   setuid   → LSM hooks      (CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK)  不grep 源码
@@ -736,7 +972,7 @@ import sys, re
 DECL = re.compile(
     r'^\s*(const\s+|struct\s+|union\s+|enum\s+|unsigned\s+|signed\s+|static\s+|'
     r'register\s+|volatile\s+|inline\s+|long\s+|short\s+|int\s+|char\s+|bool\s+|'
-    r'void\s+|size_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
+    r'void\s+|size_t\s+|ssize_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
     r'loff_t\s+|pid_t\s+|atomic_t\s+|spinlock_t\s+|struct\s+\w+\s*\**\s*\w+\s*(\[|;|=))')
 
 def decl_end_of(sig_end, s):
@@ -810,7 +1046,7 @@ import sys, re
 DECL = re.compile(
     r'^\s*(const\s+|struct\s+|union\s+|enum\s+|unsigned\s+|signed\s+|static\s+|'
     r'register\s+|volatile\s+|inline\s+|long\s+|short\s+|int\s+|char\s+|bool\s+|'
-    r'void\s+|size_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
+    r'void\s+|size_t\s+|ssize_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
     r'loff_t\s+|pid_t\s+|atomic_t\s+|spinlock_t\s+|struct\s+\w+\s*\**\s*\w+\s*(\[|;|=))')
 def decl_end_of(sig_end, s):
     i = s.find('{', sig_end)
@@ -847,23 +1083,32 @@ PYEOF
     do_hook "fs/open.c" "ksu_handle_faccessat" && ok "open.c  faccessat ✓" || bad "open.c  faccessat ✗"
 fi
 
-# --- 3) fs/stat.c : 3 个 hook ---
-#   原型（sucompat.h:16 走 4.9 的 #else 分支 / ksud.c:554,563）：
+# --- 3) fs/stat.c ---
+#   MANUAL_HOOK 模式（3 个 hook）：
 #     int  ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
 #     void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
 #     void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);
+#   SUSFS 模式（只 1 个）：
+#     ksu_handle_newfstat_ret / ksu_handle_fstat64_ret 在 ReSukiSU 源码里
+#     被 #ifdef CONFIG_KSU_MANUAL_HOOK 包着；SUSFS 模式关了 MANUAL_HOOK，
+#     再注入这两个调用会 undefined reference。SUSFS 用 vfs_fstat +
+#     ksu_handle_vfs_fstat 完成同样的 init.rc 尺寸修正。
 #   ★ vfs_fstatat 的第二参数本就是 const char __user *filename，
 #     所以直接 &filename，不要 (struct filename **) 强转（类型不匹配）。
 F="$KS/fs/stat.c"
 if do_hook "fs/stat.c" "ksu_handle_stat"; then
-    ok "stat.c  stat / newfstat_ret / fstat64_ret ✓"
+    if [ -n "$SUSFS_ON" ]; then
+        ok "stat.c  stat ✓（SUSFS 模式不需要 newfstat_ret/fstat64_ret）"
+    else
+        ok "stat.c  stat / newfstat_ret / fstat64_ret ✓"
+    fi
 else
-    python3 - "$F" <<'PYEOF'
+    python3 - "$F" "${SUSFS_ON:-0}" <<'PYEOF'
 import sys, re
 DECL = re.compile(
     r'^\s*(const\s+|struct\s+|union\s+|enum\s+|unsigned\s+|signed\s+|static\s+|'
     r'register\s+|volatile\s+|inline\s+|long\s+|short\s+|int\s+|char\s+|bool\s+|'
-    r'void\s+|size_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
+    r'void\s+|size_t\s+|ssize_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
     r'loff_t\s+|pid_t\s+|atomic_t\s+|spinlock_t\s+|struct\s+\w+\s*\**\s*\w+\s*(\[|;|=))')
 def decl_end_of(sig_end, s):
     i = s.find('{', sig_end)
@@ -882,13 +1127,20 @@ def decl_end_of(sig_end, s):
         pos = j; break
     return pos if pos is not None else j
 p = sys.argv[1]
+susfs_mode = (len(sys.argv) > 2 and sys.argv[2] not in ('', '0'))
 s = open(p, encoding='utf-8', errors='surrogateescape').read()
 cnt = 0
+want = 1 if susfs_mode else 3
 # a) vfs_fstatat -> ksu_handle_stat
 m = re.search(r'int vfs_fstatat\(([^)]*)\)', s, re.S)
 if m:
     prm = [x.strip().split()[-1].lstrip('*') for x in m.group(1).split(',') if x.strip()]
     if len(prm) >= 3:
+        # ★ vfs_fstatat(int dfd, const char __user *filename,
+        #                struct kstat *stat, int flag)
+        #   第 3 个参数是 struct kstat *，必须把最后一个参数（flag）传给
+        #   ksu_handle_stat 的 int *flags；早期版本误传 &stat，类型不匹配。
+        stat_flags = prm[-1]
         pos = decl_end_of(m.end(), s)
         if pos is not None:
             s = s[:pos] + (
@@ -896,44 +1148,50 @@ if m:
                 "\textern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n"
                 "\t\tint *flags);\n"
                 "\n\t/* ReSukiSU hook */\n"
-                f"\tif (ksu_handle_stat(&{prm[0]}, &{prm[1]}, &{prm[2]}))\n"
+                f"\tif (ksu_handle_stat(&{prm[0]}, &{prm[1]}, &{stat_flags}))\n"
                 "\t\treturn -EPERM;\n") + s[pos:]
             cnt += 1
-# b) newfstatat -> ksu_handle_newfstat_ret
-m = re.search(r'SYSCALL_DEFINE4\(newfstatat,', s)
-if m:
-    pos = decl_end_of(m.end(), s)
-    if pos is not None:
-        s = s[:pos] + (
-            "\n\t/* ReSukiSU: hook handler prototype */\n"
-            "\textern void ksu_handle_newfstat_ret(unsigned int *fd,\n"
-            "\t\tstruct stat __user **statbuf_ptr);\n"
-            "\n\t/* ReSukiSU hook */\n\t{\n\tunsigned int _fd = dfd;\n"
-            "\tstruct stat __user **_sb = &statbuf;\n"
-            "\tksu_handle_newfstat_ret(&_fd, &_sb);\n\t}\n") + s[pos:]
-        cnt += 1
-# c) fstat64 -> ksu_handle_fstat64_ret
-m = re.search(r'SYSCALL_DEFINE2\(fstat64,', s)
-if m:
-    pos = decl_end_of(m.end(), s)
-    if pos is not None:
-        s = s[:pos] + (
-            "\n\t/* ReSukiSU: hook handler prototype */\n"
-            "\textern void ksu_handle_fstat64_ret(unsigned long *fd,\n"
-            "\t\tstruct stat64 __user **statbuf_ptr);\n"
-            "\n\t/* ReSukiSU hook */\n\t{\n\tunsigned long _fd = fd;\n"
-            "\tstruct stat64 __user **_sb = &statbuf;\n"
-            "\tksu_handle_fstat64_ret(&_fd, &_sb);\n\t}\n") + s[pos:]
-        cnt += 1
-if cnt != 3:
-    sys.stderr.write('    stat.c: 只注入 %d/3\n' % cnt)
+# b/c) 只有 MANUAL_HOOK 模式才注入 newfstat_ret / fstat64_ret
+if not susfs_mode:
+    # b) newfstatat -> ksu_handle_newfstat_ret
+    m = re.search(r'SYSCALL_DEFINE4\(newfstatat,', s)
+    if m:
+        pos = decl_end_of(m.end(), s)
+        if pos is not None:
+            s = s[:pos] + (
+                "\n\t/* ReSukiSU: hook handler prototype */\n"
+                "\textern void ksu_handle_newfstat_ret(unsigned int *fd,\n"
+                "\t\tstruct stat __user **statbuf_ptr);\n"
+                "\n\t/* ReSukiSU hook */\n\t{\n\tunsigned int _fd = dfd;\n"
+                "\tstruct stat __user **_sb = &statbuf;\n"
+                "\tksu_handle_newfstat_ret(&_fd, &_sb);\n\t}\n") + s[pos:]
+            cnt += 1
+    # c) fstat64 -> ksu_handle_fstat64_ret
+    m = re.search(r'SYSCALL_DEFINE2\(fstat64,', s)
+    if m:
+        pos = decl_end_of(m.end(), s)
+        if pos is not None:
+            s = s[:pos] + (
+                "\n\t/* ReSukiSU: hook handler prototype */\n"
+                "\textern void ksu_handle_fstat64_ret(unsigned long *fd,\n"
+                "\t\tstruct stat64 __user **statbuf_ptr);\n"
+                "\n\t/* ReSukiSU hook */\n\t{\n\tunsigned long _fd = fd;\n"
+                "\tstruct stat64 __user **_sb = &statbuf;\n"
+                "\tksu_handle_fstat64_ret(&_fd, &_sb);\n\t}\n") + s[pos:]
+            cnt += 1
+if cnt != want:
+    sys.stderr.write('    stat.c: 只注入 %d/%d\n' % (cnt, want))
     sys.exit(3)
 open(p, 'w', encoding='utf-8', errors='surrogateescape', newline='').write(s)
 sys.exit(0)
 PYEOF
-    for h in ksu_handle_stat ksu_handle_newfstat_ret ksu_handle_fstat64_ret; do
-        do_hook "fs/stat.c" "$h" && ok "stat.c  $h ✓" || bad "stat.c  $h ✗"
-    done
+    if [ -n "$SUSFS_ON" ]; then
+        do_hook "fs/stat.c" "ksu_handle_stat" && ok "stat.c  ksu_handle_stat ✓" || bad "stat.c  ksu_handle_stat ✗"
+    else
+        for h in ksu_handle_stat ksu_handle_newfstat_ret ksu_handle_fstat64_ret; do
+            do_hook "fs/stat.c" "$h" && ok "stat.c  $h ✓" || bad "stat.c  $h ✗"
+        done
+    fi
 fi
 
 # --- 4) kernel/reboot.c : ksu_handle_sys_reboot ---
@@ -949,7 +1207,7 @@ import sys, re
 DECL = re.compile(
     r'^\s*(const\s+|struct\s+|union\s+|enum\s+|unsigned\s+|signed\s+|static\s+|'
     r'register\s+|volatile\s+|inline\s+|long\s+|short\s+|int\s+|char\s+|bool\s+|'
-    r'void\s+|size_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
+    r'void\s+|size_t\s+|ssize_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
     r'loff_t\s+|pid_t\s+|atomic_t\s+|spinlock_t\s+|struct\s+\w+\s*\**\s*\w+\s*(\[|;|=))')
 def decl_end_of(sig_end, s):
     i = s.find('{', sig_end)
@@ -986,16 +1244,237 @@ PYEOF
     do_hook "kernel/reboot.c" "ksu_handle_sys_reboot" && ok "reboot.c  sys_reboot ✓" || bad "reboot.c  sys_reboot ✗"
 fi
 
-# ---- 汇总：按 Kbuild 实际 grep 的 6 个检查点逐一验证 ----
+# --- 5) SUSFS inline 模式专用：kernel/sys.c : ksu_handle_setresuid ---
+#   原型（setuid_hook.h:10）：
+#     int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+#   ★ 只在 SUSFS 模式注入：MANUAL_HOOK 模式由 LSM task_fix_setuid 托管，
+#     两处同时调用会在每个 setuid 上重复执行 hook。
+if [ -n "$SUSFS_ON" ]; then
+    F="$KS/kernel/sys.c"
+    if do_hook "kernel/sys.c" "ksu_handle_setresuid"; then
+        ok "sys.c  setresuid ✓"
+    else
+        python3 - "$F" <<'PYEOF'
+import sys, re
+DECL = re.compile(
+    r'^\s*(const\s+|struct\s+|union\s+|enum\s+|unsigned\s+|signed\s+|static\s+|'
+    r'register\s+|volatile\s+|inline\s+|long\s+|short\s+|int\s+|char\s+|bool\s+|'
+    r'void\s+|size_t\s+|ssize_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
+    r'loff_t\s+|pid_t\s+|atomic_t\s+|spinlock_t\s+|struct\s+\w+\s*\**\s*\w+\s*(\[|;|=))')
+def decl_end_of(sig_end, s):
+    i = s.find('{', sig_end)
+    if i < 0: return None
+    j = i + 1; pos = None
+    while j < len(s):
+        while j < len(s) and s[j] in ' \t\r\n': j += 1
+        if j >= len(s): break
+        if s.startswith('/*', j):
+            e = s.find('*/', j + 2); j = (e + 2) if e > 0 else len(s); continue
+        if s.startswith('//', j):
+            e = s.find('\n', j); j = (e + 1) if e > 0 else len(s); continue
+        k = j
+        while k < len(s) and s[k] != '\n' and s[k] != ';': k += 1
+        if DECL.match(s[j:k]): j = k + 1; continue
+        pos = j; break
+    return pos if pos is not None else j
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='surrogateescape').read()
+m = re.search(r'SYSCALL_DEFINE3\(setresuid,', s)
+if not m: sys.exit(1)
+pos = decl_end_of(m.end(), s)
+if pos is None: sys.exit(1)
+_ext = ("\n\t/* ReSukiSU: hook handler prototype */\n"
+        "\textern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n")
+_hook = ("\n\t/* ReSukiSU hook */\n"
+         "\t(void)ksu_handle_setresuid(ruid, euid, suid);\n")
+s = s[:pos] + _ext + _hook + s[pos:]
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline='').write(s)
+sys.exit(0)
+PYEOF
+        do_hook "kernel/sys.c" "ksu_handle_setresuid" && ok "sys.c  setresuid ✓" || bad "sys.c  setresuid ✗"
+    fi
+
+    # --- 6) SUSFS inline 模式专用：fs/read_write.c : ksu_handle_sys_read ---
+    #   原型（ksud.c:658，BakaSU/ReSukiSU 三参数版）：
+    #     int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr,
+    #                             size_t *count_ptr);
+    #   4.9 的 SYSCALL_DEFINE3(read,...) 里 buf/count 是函数形参，直接取址。
+    F="$KS/fs/read_write.c"
+    if do_hook "fs/read_write.c" "ksu_handle_sys_read"; then
+        ok "read_write.c  sys_read ✓"
+    else
+        python3 - "$F" <<'PYEOF'
+import sys, re
+DECL = re.compile(
+    r'^\s*(const\s+|struct\s+|union\s+|enum\s+|unsigned\s+|signed\s+|static\s+|'
+    r'register\s+|volatile\s+|inline\s+|long\s+|short\s+|int\s+|char\s+|bool\s+|'
+    r'void\s+|size_t\s+|ssize_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
+    r'loff_t\s+|pid_t\s+|atomic_t\s+|spinlock_t\s+|struct\s+\w+\s*\**\s*\w+\s*(\[|;|=))')
+def decl_end_of(sig_end, s):
+    i = s.find('{', sig_end)
+    if i < 0: return None
+    j = i + 1; pos = None
+    while j < len(s):
+        while j < len(s) and s[j] in ' \t\r\n': j += 1
+        if j >= len(s): break
+        if s.startswith('/*', j):
+            e = s.find('*/', j + 2); j = (e + 2) if e > 0 else len(s); continue
+        if s.startswith('//', j):
+            e = s.find('\n', j); j = (e + 1) if e > 0 else len(s); continue
+        k = j
+        while k < len(s) and s[k] != '\n' and s[k] != ';': k += 1
+        if DECL.match(s[j:k]): j = k + 1; continue
+        pos = j; break
+    return pos if pos is not None else j
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='surrogateescape').read()
+m = re.search(r'SYSCALL_DEFINE3\(read,', s)
+if not m: sys.exit(1)
+pos = decl_end_of(m.end(), s)
+if pos is None: sys.exit(1)
+# ★ 块作用域（函数体内）的 extern 不能带 __read_mostly 段属性：
+#     error: section attribute cannot be specified for local variables
+#   变量定义在 ksud.c 里已经是 __read_mostly，这里只声明类型。
+_ext = ("\n\t/* ReSukiSU: hook handler prototype */\n"
+        "\textern bool ksu_init_rc_hook;\n"
+        "\textern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr,\n"
+        "\t\tsize_t *count_ptr);\n")
+_hook = ("\n\t/* ReSukiSU hook */\n"
+         "\tif (unlikely(ksu_init_rc_hook))\n"
+         "\t\tksu_handle_sys_read(fd, &buf, &count);\n")
+s = s[:pos] + _ext + _hook + s[pos:]
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline='').write(s)
+sys.exit(0)
+PYEOF
+        do_hook "fs/read_write.c" "ksu_handle_sys_read" && ok "read_write.c  sys_read ✓" || bad "read_write.c  sys_read ✗"
+    fi
+
+    # --- 7) SUSFS inline 模式专用：drivers/input/input.c : input hook ---
+    #   原型（ksud.c:684）：
+    #     int ksu_handle_input_handle_event(unsigned int *type,
+    #                                       unsigned int *code, int *value);
+    #   4.9 的 void input_event(...) 形参是值传递，调用处取址。
+    F="$KS/drivers/input/input.c"
+    if do_hook "drivers/input/input.c" "ksu_handle_input_handle_event"; then
+        ok "input.c  input_handle_event ✓"
+    else
+        python3 - "$F" <<'PYEOF'
+import sys, re
+DECL = re.compile(
+    r'^\s*(const\s+|struct\s+|union\s+|enum\s+|unsigned\s+|signed\s+|static\s+|'
+    r'register\s+|volatile\s+|inline\s+|long\s+|short\s+|int\s+|char\s+|bool\s+|'
+    r'void\s+|size_t\s+|ssize_t\s+|uid_t\s+|gid_t\s+|kuid_t\s+|kgid_t\s+|mode_t\s+|dev_t\s+|'
+    r'loff_t\s+|pid_t\s+|atomic_t\s+|spinlock_t\s+|struct\s+\w+\s*\**\s*\w+\s*(\[|;|=))')
+def decl_end_of(sig_end, s):
+    i = s.find('{', sig_end)
+    if i < 0: return None
+    j = i + 1; pos = None
+    while j < len(s):
+        while j < len(s) and s[j] in ' \t\r\n': j += 1
+        if j >= len(s): break
+        if s.startswith('/*', j):
+            e = s.find('*/', j + 2); j = (e + 2) if e > 0 else len(s); continue
+        if s.startswith('//', j):
+            e = s.find('\n', j); j = (e + 1) if e > 0 else len(s); continue
+        k = j
+        while k < len(s) and s[k] != '\n' and s[k] != ';': k += 1
+        if DECL.match(s[j:k]): j = k + 1; continue
+        pos = j; break
+    return pos if pos is not None else j
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='surrogateescape').read()
+m = re.search(r'void input_event\(struct input_dev \*dev,', s)
+if not m: sys.exit(1)
+pos = decl_end_of(m.end(), s)
+if pos is None: sys.exit(1)
+# ★ 同上：函数体内 extern 不能带 __read_mostly。
+_ext = ("\n\t/* ReSukiSU: hook handler prototype */\n"
+        "\textern bool ksu_input_hook;\n"
+        "\textern int ksu_handle_input_handle_event(unsigned int *type,\n"
+        "\t\tunsigned int *code, int *value);\n")
+_hook = ("\n\t/* ReSukiSU hook */\n"
+         "\tif (unlikely(ksu_input_hook))\n"
+         "\t\tksu_handle_input_handle_event(&type, &code, &value);\n")
+s = s[:pos] + _ext + _hook + s[pos:]
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline='').write(s)
+sys.exit(0)
+PYEOF
+        do_hook "drivers/input/input.c" "ksu_handle_input_handle_event" \
+            && ok "input.c  input_handle_event ✓" || bad "input.c  input_handle_event ✗"
+    fi
+
+    # --- 8) SUSFS inline 模式专用：fs/stat.c : vfs_fstat 的 init.rc 尺寸修正 ---
+    #   原型（ksud.c:576，CONFIG_KSU_SUSFS 专用）：
+    #     void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);
+    #   作用：init.rc 内容被 KSU 注入后，fstat 报告的 st_size 要同步加上
+    #   ksu_rc_len，否则隐藏内容与文件长度对不上。
+    #   ★ 必须在 vfs_getattr() 填好 stat 之后、fdput() 之前调用。
+    F="$KS/fs/stat.c"
+    if do_hook "fs/stat.c" "ksu_handle_vfs_fstat"; then
+        ok "stat.c  vfs_fstat ✓"
+    else
+        python3 - "$F" <<'PYEOF'
+import sys, re
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='surrogateescape').read()
+m = re.search(r'int vfs_fstat\(unsigned int fd, struct kstat \*stat\)\s*\{', s)
+if not m:
+    sys.exit(1)
+start = m.end()
+end = s.find('\n}', start)
+if end < 0:
+    sys.exit(1)
+body = s[start:end]
+old = "\t\terror = vfs_getattr(&f.file->f_path, stat);\n\t\tfdput(f);"
+new = ("\t\terror = vfs_getattr(&f.file->f_path, stat);\n"
+       "#ifdef CONFIG_KSU_SUSFS\n"
+       "\t\tif (unlikely(ksu_init_rc_hook))\n"
+       "\t\t\tksu_handle_vfs_fstat(fd, &stat->size);\n"
+       "#endif\n"
+       "\t\tfdput(f);")
+if "ksu_handle_vfs_fstat" not in body:
+    if old not in body:
+        sys.exit(3)
+    body = body.replace(old, new, 1)
+    s = s[:start] + body + s[end:]
+_ext = ("#ifdef CONFIG_KSU_SUSFS\n"
+        "extern bool ksu_init_rc_hook __read_mostly;\n"
+        "extern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);\n"
+        "#endif\n\n")
+if "extern void ksu_handle_vfs_fstat" not in s:
+    s = s.replace("int vfs_fstat(unsigned int fd, struct kstat *stat)",
+                  _ext + "int vfs_fstat(unsigned int fd, struct kstat *stat)", 1)
+open(p, 'w', encoding='utf-8', errors='surrogateescape', newline='').write(s)
+sys.exit(0)
+PYEOF
+        do_hook "fs/stat.c" "ksu_handle_vfs_fstat" \
+            && ok "stat.c  vfs_fstat ✓" || bad "stat.c  vfs_fstat ✗"
+    fi
+fi
+
+# ---- 汇总：按实际 hook 模式逐一验证 ----
 say ""
-say "  ── Kbuild 将 grep 检查这 6 处 ──"
+if [ -n "$SUSFS_ON" ]; then
+    say "  ── SUSFS inline 模式将检查这 8 处 ──"
+    HOOK_CHECK="fs/exec.c:ksu_handle_execveat \
+fs/open.c:ksu_handle_faccessat \
+fs/stat.c:ksu_handle_stat \
+fs/stat.c:ksu_handle_vfs_fstat \
+kernel/reboot.c:ksu_handle_sys_reboot \
+kernel/sys.c:ksu_handle_setresuid \
+fs/read_write.c:ksu_handle_sys_read \
+drivers/input/input.c:ksu_handle_input_handle_event"
+else
+    say "  ── MANUAL_HOOK 模式将检查这 6 处 ──"
+    HOOK_CHECK="fs/exec.c:ksu_handle_execveat \
+fs/open.c:ksu_handle_faccessat \
+fs/stat.c:ksu_handle_stat \
+fs/stat.c:ksu_handle_newfstat_ret \
+fs/stat.c:ksu_handle_fstat64_ret \
+kernel/reboot.c:ksu_handle_sys_reboot"
+fi
 MISSING=0
-for c in "fs/exec.c:ksu_handle_execveat" \
-         "fs/open.c:ksu_handle_faccessat" \
-         "fs/stat.c:ksu_handle_stat" \
-         "fs/stat.c:ksu_handle_newfstat_ret" \
-         "fs/stat.c:ksu_handle_fstat64_ret" \
-         "kernel/reboot.c:ksu_handle_sys_reboot"; do
+for c in $HOOK_CHECK; do
     cf="${c%%:*}"; ch="${c#*:}"
     if [ ! -f "$KS/$cf" ]; then
         bad "$ch  (缺文件 $cf)"; MISSING=$((MISSING+1))
@@ -1005,14 +1484,16 @@ for c in "fs/exec.c:ksu_handle_execveat" \
         bad "$ch  ($cf)"; MISSING=$((MISSING+1))
     fi
 done
-say ""
-say "  ── 以下 3 处由 Kbuild LSM / input_handler 托管，无需源码注入 ──"
-ok "ksu_handle_setresuid(LSM)              ← 不注入"
-ok "ksu_handle_sys_read(LSM)               ← 不注入"
-ok "ksu_handle_input_handle_event(input)   ← 不注入"
+if [ -z "$SUSFS_ON" ]; then
+    say ""
+    say "  ── 以下 3 处由 Kbuild LSM / input_handler 托管，无需源码注入 ──"
+    ok "ksu_handle_setresuid(LSM)              ← 不注入"
+    ok "ksu_handle_sys_read(LSM)               ← 不注入"
+    ok "ksu_handle_input_handle_event(input)   ← 不注入"
+fi
 
 if [ "$MISSING" -gt 0 ]; then
-    bad "有 $MISSING 个 Kbuild 检查点缺失，Kbuild 会 $(error) 拒绝"
+    bad "有 $MISSING 个 hook 检查点缺失，Kbuild/内核会 $(error) 或行为异常"
     exit 1
 fi
 
@@ -1046,7 +1527,12 @@ fi
 KCFG="$OUT/.config"
 [ -f "$KCFG" ] || { bad "生成 .config 失败"; exit 1; }
 CHK_FAIL=0
-for k in KSU KSU_MANUAL_HOOK KALLSYMS_ALL; do
+if [ -n "$SUSFS_ON" ]; then
+    CHK_LIST="KSU KSU_SUSFS KALLSYMS_ALL"
+else
+    CHK_LIST="KSU KSU_MANUAL_HOOK KALLSYMS_ALL"
+fi
+for k in $CHK_LIST; do
     if grep -qE "^CONFIG_$k=y$" "$KCFG" 2>/dev/null; then
         ok "CONFIG_$k=y"
     else
@@ -1054,6 +1540,29 @@ for k in KSU KSU_MANUAL_HOOK KALLSYMS_ALL; do
         CHK_FAIL=$((CHK_FAIL+1))
     fi
 done
+
+# ---- SUSFS 模式：子项 + 依赖 + 必须没有 MANUAL_HOOK ----
+if [ -n "$SUSFS_ON" ]; then
+    if ! grep -qE '^CONFIG_THREAD_INFO_IN_TASK=y$' "$KCFG" 2>/dev/null; then
+        bad "CONFIG_THREAD_INFO_IN_TASK 未开启 → CONFIG_KSU_SUSFS 的 Kconfig 依赖不满足"
+        say "    华为 4.9.148 的 arch/arm64/Kconfig 已 select 该项；若这里缺失，"
+        say "    说明 defconfig/树被改过，SUSFS 会被 olddefconfig 丢弃。"
+        CHK_FAIL=$((CHK_FAIL+1))
+    fi
+    if grep -qE '^CONFIG_KSU_MANUAL_HOOK=y$' "$KCFG" 2>/dev/null; then
+        bad "CONFIG_KSU_MANUAL_HOOK 仍为 y → 会走 LSM 分支，susfs_init() 不会被调用"
+        CHK_FAIL=$((CHK_FAIL+1))
+    fi
+    for k in SUS_PATH SUS_MOUNT SUS_KSTAT SPOOF_UNAME ENABLE_LOG \
+             HIDE_KSU_SUSFS_SYMBOLS SPOOF_CMDLINE_OR_BOOTCONFIG \
+             OPEN_REDIRECT SUS_MAP; do
+        if grep -qE "^CONFIG_KSU_SUSFS_$k=y$" "$KCFG" 2>/dev/null; then
+            ok "CONFIG_KSU_SUSFS_$k=y"
+        else
+            info "CONFIG_KSU_SUSFS_$k 未生效（该子功能关闭，不影响编译）"
+        fi
+    done
+fi
 # ---- 校验最终 .config 里检测项确实关闭 ----
 # ★ 必须区分两种「未落地」原因，二者性质完全不同：
 #   A) 被 select 回来（=y）→ 该检测仍在编译运行，有风险，必须报出来
@@ -1252,51 +1761,71 @@ IMG="$IMGOUT/kernel.img"
 TOOLS="$KS/tools"
 IMG_GZ="$OUT/arch/arm64/boot/Image.gz"
 
-# ★ 官方 tools/pack_kernerimage_cmd.sh 的实际内容（已从源码核对，非猜测）：
-#     ./mkbootimg --kernel kernel --base 0x0 \
-#       --cmdline "loglevel=4 initcall_debug=n page_tracker=on \
-#       ... androidboot.selinux=enforcing buildvariant=user" \
-#       --tags_offset 0x07A00000 --kernel_offset 0x00080000 \
-#       --ramdisk_offset 0x07C00000 --header_version 1 \
-#       --os_version 9 --os_patch_level 2019-11-01 --output kernel.img
+# ★★ 打包只用【源码自带的官方打包脚本】，不写死任何机型的 offset。
 #
-#   ★ 它把内核文件名【写死为 kernel】（不是 Image.gz），
-#     且不接任何位置参数 —— 误传 Image.gz 路径会报
-#     "argument --kernel: can't open 'kernel'"。
-#   ★ 这些 offset / os_version 是 CLT(P20 Pro) 官方值，
-#     不要套用社区文档里荣耀 Note10 的参数。
-MK_CMDLINE="loglevel=4 initcall_debug=n page_tracker=on unmovable_isolate1=2:192M,3:224M,4:256M printktimer=0xfff0a000,0x534,0x538 androidboot.selinux=enforcing buildvariant=user"
-MK_TAGS="0x07A00000"; MK_KOFF="0x00080000"; MK_ROFF="0x07C00000"
-MK_HV="1"; MK_OSV="9"; MK_OSP="2019-11-01"
-
+#   每个机型的 kernel_offset / ramdisk_offset / tags_offset / cmdline /
+#   os_version 都不同，写死在构建脚本里必然只适用一个机型。
+#   而华为官方内核源码包自带 tools/pack_kernerimage_cmd.sh，
+#   里面就是【该机型的官方值】——直接用它，参数 100% 与官方一致。
+#
+#   ★ 官方脚本的已知特点（已实测）：
+#     - 内部调用 ./mkbootimg --kernel kernel ...，内核名写死为 kernel
+#     - 不接任何位置参数
+#     - 输出 kernel.img 到当前目录
+#   所以执行前必须把 Image.gz 复制成 tools/kernel，执行后把产物搬走。
+#
+#   找不到官方脚本 → 直接报错退出。
+#   ★ 不用"通用默认参数"兜底：offset 猜错会导致 bootloader 读不到
+#     内核大小与启动参数，开机必然失败，而文件看起来是正常的。
+PACK_SH=$(ls "$TOOLS"/pack_kernerimage_cmd*.sh "$TOOLS"/pack_kernel*cmd*.sh 2>/dev/null | head -1)
 PACKED=""
-if [ -f "$IMG_GZ" ] && [ -f "$TOOLS/mkbootimg" ]; then
-    info "用源码自带 mkbootimg + CLT 官方 offset"
-    chmod +x "$TOOLS/mkbootimg" 2>/dev/null
-    ( cd "$TOOLS" && ./mkbootimg --kernel "$IMG_GZ" --base 0x0 \
-        --cmdline "$MK_CMDLINE" \
-        --tags_offset "$MK_TAGS" --kernel_offset "$MK_KOFF" \
-        --ramdisk_offset "$MK_ROFF" --header_version "$MK_HV" \
-        --os_version "$MK_OSV" --os_patch_level "$MK_OSP" \
-        --output kernel.img ) > "$LOGS/pack.log" 2>&1
-    if [ -f "$TOOLS/kernel.img" ]; then
-        cp -f "$TOOLS/kernel.img" "$IMG"
-        rm -f "$TOOLS/kernel.img"
-        PACKED=1
-    fi
+
+if [ -z "$PACK_SH" ] || [ ! -f "$PACK_SH" ]; then
+    bad "源码中找不到官方打包脚本（tools/pack_kernerimage_cmd.sh）"
+    say ""
+    say "  本脚本只使用内核源码自带的官方打包脚本（各机型参数在脚本里）。"
+    say "  找不到说明这个内核源码包不含打包脚本，或解包路径异常。"
+    say ""
+    say "  当前 tools/ 下与打包相关的文件："
+    ls -la "$TOOLS" 2>/dev/null | grep -iE "pack|mkbootimg|img" | sed 's/^/      /' \
+        || echo "      (无)"
+    say ""
+    say "  处理办法："
+    say "    1) 确认内核源码包完整（官方 HuaweiUpdateExtractor 提取的整包）"
+    say "    2) 或手动用 mkbootimg 打包，参数务必取自你手机原厂 boot.img"
+    say "       可用 bootimg_hdr.py 读出原厂头部字段"
+    exit 1
 fi
 
-if [ -z "$PACKED" ] && [ -f "$TOOLS/mkbootimg" ] && [ -f "$IMG_GZ" ]; then
-    info "备用：直接输出到目标路径"
-    ( cd "$TOOLS" && ./mkbootimg --kernel "$IMG_GZ" --base 0x0 \
-        --cmdline "$MK_CMDLINE" \
-        --tags_offset "$MK_TAGS" --kernel_offset "$MK_KOFF" \
-        --ramdisk_offset "$MK_ROFF" --header_version "$MK_HV" \
-        --os_version "$MK_OSV" --os_patch_level "$MK_OSP" \
-        -o "$IMG" ) > "$LOGS/pack.log" 2>&1
-    [ -f "$IMG" ] && PACKED=1
+if [ ! -f "$IMG_GZ" ]; then
+    bad "找不到编译产物 Image.gz，无法打包"
+    exit 1
 fi
 
+info "用源码自带官方打包脚本: $(basename "$PACK_SH")"
+chmod +x "$TOOLS/mkbootimg" "$PACK_SH" 2>/dev/null
+# 官方脚本写死 --kernel kernel，先在 tools/ 里准备这个名字
+cp -f "$IMG_GZ" "$TOOLS/kernel"
+( cd "$TOOLS" && bash "$(basename "$PACK_SH")" ) > "$LOGS/pack.log" 2>&1
+PACK_RC=$?
+rm -f "$TOOLS/kernel"
+
+# 官方脚本输出 kernel.img（个别机型输出名不同，取最近生成的 img）
+OUTIMG=$(ls -t "$TOOLS"/*.img 2>/dev/null | head -1)
+if [ $PACK_RC -eq 0 ] && [ -n "$OUTIMG" ] && [ -s "$OUTIMG" ]; then
+    cp -f "$OUTIMG" "$IMG"
+    rm -f "$OUTIMG"
+    PACKED=1
+    ok "官方脚本打包完成"
+else
+    bad "官方打包脚本执行失败（退出码 $PACK_RC）"
+    say ""
+    say "  打包日志："
+    tail -12 "$LOGS/pack.log" 2>/dev/null | sed 's/^/      /'
+    say ""
+    say "  可用内核(gzip): $IMG_GZ"
+    exit 1
+fi
 if [ -n "$PACKED" ]; then
     ok "打包完成 $(du -h "$IMG" | cut -f1)"
     # ---- 自动校验头部：kernel_size 必须等于内核实际字节数 ----
